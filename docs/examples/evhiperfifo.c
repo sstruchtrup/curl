@@ -97,6 +97,12 @@ typedef struct _ConnInfo
   char *url;
   GlobalInfo *global;
   char error[CURL_ERROR_SIZE];
+
+  /* used to schedule a timer to restart the transfer */
+  ev_timer timer;
+
+  /* indicating if the transfer should be paused */
+  int pause;
 } ConnInfo;
 
 
@@ -311,7 +317,19 @@ static size_t write_cb(void *ptr, size_t size, size_t nmemb, void *data)
   size_t realsize = size * nmemb;
   ConnInfo *conn = (ConnInfo*) data;
   (void)ptr;
-  (void)conn;
+
+  fprintf(stderr, "Received %zu bytes\n", realsize);
+
+  if (conn->pause)
+  {
+    fprintf(MSG_OUT, "*** pausing transfer ***\n");
+    conn->pause = 0;
+    // curl_easy_pause(conn->easy, CURLPAUSE_ALL);
+    ev_timer_start(conn->global->loop, &conn->timer);
+
+    return CURL_WRITEFUNC_PAUSE;
+  }
+
   return realsize;
 }
 
@@ -329,6 +347,14 @@ static int prog_cb(void *p, double dltotal, double dlnow, double ult,
 }
 
 
+static void unpause_handle(struct ev_loop *loop, struct ev_timer *timer, int ev)
+{
+  fprintf(MSG_OUT, "*** timeout, restarting transfer ***\n");
+
+  ConnInfo *conn = timer->data;
+  curl_easy_pause(conn->easy, CURLPAUSE_CONT);
+}
+
 /* Create a new easy handle, and add it to the global curl_multi */
 static void new_conn(char *url, GlobalInfo *g)
 {
@@ -338,6 +364,9 @@ static void new_conn(char *url, GlobalInfo *g)
   conn = calloc(1, sizeof(ConnInfo));
   conn->error[0]='\0';
 
+  ev_timer_init(&conn->timer, unpause_handle, 1, 0);
+  conn->timer.data = conn;
+
   conn->easy = curl_easy_init();
   if(!conn->easy) {
     fprintf(MSG_OUT, "curl_easy_init() failed, exiting!\n");
@@ -345,6 +374,7 @@ static void new_conn(char *url, GlobalInfo *g)
   }
   conn->global = g;
   conn->url = strdup(url);
+  conn->pause = 1;
   curl_easy_setopt(conn->easy, CURLOPT_URL, conn->url);
   curl_easy_setopt(conn->easy, CURLOPT_WRITEFUNCTION, write_cb);
   curl_easy_setopt(conn->easy, CURLOPT_WRITEDATA, conn);
@@ -354,8 +384,6 @@ static void new_conn(char *url, GlobalInfo *g)
   curl_easy_setopt(conn->easy, CURLOPT_NOPROGRESS, 0L);
   curl_easy_setopt(conn->easy, CURLOPT_PROGRESSFUNCTION, prog_cb);
   curl_easy_setopt(conn->easy, CURLOPT_PROGRESSDATA, conn);
-  curl_easy_setopt(conn->easy, CURLOPT_LOW_SPEED_TIME, 3L);
-  curl_easy_setopt(conn->easy, CURLOPT_LOW_SPEED_LIMIT, 10L);
 
   fprintf(MSG_OUT,
           "Adding easy %p to multi %p (%s)\n", conn->easy, g->multi, url);
